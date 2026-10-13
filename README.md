@@ -1,6 +1,6 @@
 # horizon-azure-kit
 
-Shared Azure plumbing for Horizon Tech's desktop tools ([Arkived](https://github.com/Horizon-Tech-doo/arkived), [Dispatched](https://github.com/Horizon-Tech-doo/dispatched)):
+Shared Azure plumbing for Horizon Tech's desktop tools. Used by [Dispatched](https://github.com/Horizon-Tech-doo/dispatched); [Arkived](https://github.com/Horizon-Tech-doo/arkived) will migrate to it.
 
 - `auth` — Microsoft Entra sign-in (browser + PKCE, device code), refresh-token cache, per-scope token exchange
 - `secrets` — OS keychain credential store (chunked for large tokens) + in-memory store
