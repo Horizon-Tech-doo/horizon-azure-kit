@@ -13,3 +13,10 @@ Only code that more than one product needs lives here. Product domain logic does
 Not affiliated with Microsoft. "Azure" and "Microsoft Entra" are trademarks of Microsoft Corporation.
 
 Licensed under Apache-2.0.
+
+## Changes
+
+- **0.2.0**
+  - `EntraSession::token_for` no longer replaces the stored (home-tenant) refresh token after refreshing against another tenant.
+  - Signing in again wins over a refresh that is still in flight.
+- **0.1.0**: initial release (Dispatched M0).
