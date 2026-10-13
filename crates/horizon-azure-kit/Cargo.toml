@@ -1,0 +1,39 @@
+[package]
+name = "horizon-azure-kit"
+description = "Shared Azure plumbing for Horizon Tech desktop tools: Entra sign-in, OS keychain secrets, ARM discovery, SAS signing, safety policy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["azure", "entra", "keychain", "sas"]
+categories = ["authentication", "api-bindings"]
+
+[features]
+default = ["keychain"]
+keychain = ["dep:keyring"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+hmac = "0.12"
+keyring = { version = "4", optional = true }
+percent-encoding = "2"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset", "system-proxy", "json", "form", "query"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["serde", "serde-well-known"] }
+tokio = { version = "1", features = ["net", "io-util", "time", "macros", "rt", "sync"] }
+tokio-util = "0.7"
+tracing = "0.1"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+mockito = "1"
+tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/horizon-azure-kit"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+authors = ["Hamza Abdagić <hamza.abdagic@horizon-tech.io>", "Horizon Tech d.o.o."]
+repository = "https://github.com/Horizon-Tech-doo/horizon-azure-kit"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
