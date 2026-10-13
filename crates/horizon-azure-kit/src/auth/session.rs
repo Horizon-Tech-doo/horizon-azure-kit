@@ -54,13 +54,21 @@ struct StoredRefresh {
 
 type CacheKey = (String, String, String); // (sign-in id, tenant, scope)
 
+/// Mutable session state, guarded by one lock that is never held across an await.
+#[derive(Default)]
+struct SessionState {
+    cache: HashMap<CacheKey, AccessToken>,
+    /// Bumped by `logout`, so a refresh that started before a sign-out can detect it.
+    generations: HashMap<String, u64>,
+}
+
 /// Entra sign-in manager for one cloud.
 pub struct EntraSession {
     oauth: OAuthClient,
     cloud: AzureCloud,
     secrets: Arc<dyn CredentialStore>,
     key_prefix: String,
-    cache: Mutex<HashMap<CacheKey, AccessToken>>,
+    state: Mutex<SessionState>,
 }
 
 impl EntraSession {
@@ -75,7 +83,7 @@ impl EntraSession {
             cloud,
             secrets,
             key_prefix: key_prefix.into(),
-            cache: Mutex::new(HashMap::new()),
+            state: Mutex::new(SessionState::default()),
         }
     }
 
@@ -189,13 +197,24 @@ impl EntraSession {
         scope: &str,
     ) -> KitResult<AccessToken> {
         let stored = self.load(sign_in)?;
+        if stored.client_id != self.oauth.client_id() {
+            return Err(KitError::NotSignedIn(format!(
+                "{} was signed in with a different client; sign in again",
+                sign_in.user_principal
+            )));
+        }
+        let home = tenant.is_none_or(|t| t == stored.tenant_id);
         let tenant = tenant.unwrap_or(&stored.tenant_id).to_string();
         let key = (sign_in.id.clone(), tenant.clone(), scope.to_string());
-        if let Some(hit) = self.cache.lock().expect("token cache poisoned").get(&key)
-            && hit.expires_on - OffsetDateTime::now_utc() > REFRESH_MARGIN
-        {
-            return Ok(hit.clone());
-        }
+        let generation = {
+            let state = self.state.lock().expect("session state poisoned");
+            if let Some(hit) = state.cache.get(&key)
+                && hit.expires_on - OffsetDateTime::now_utc() > REFRESH_MARGIN
+            {
+                return Ok(hit.clone());
+            }
+            state.generations.get(&sign_in.id).copied().unwrap_or(0)
+        };
         let resp = match self
             .oauth
             .refresh(
@@ -207,6 +226,15 @@ impl EntraSession {
         {
             Ok(resp) => resp,
             Err(KitError::NotSignedIn(msg)) => {
+                if home {
+                    // A revoked or expired home session is forgotten, so
+                    // `is_signed_in` reports false. Skipped if the user signed
+                    // out (or signed in again) while the refresh was in flight.
+                    let state = self.state.lock().expect("session state poisoned");
+                    if state.generations.get(&sign_in.id).copied().unwrap_or(0) == generation {
+                        self.secrets.delete(&self.key(&sign_in.id))?;
+                    }
+                }
                 return Err(KitError::NotSignedIn(format!(
                     "{}: {msg}",
                     sign_in.user_principal
@@ -214,6 +242,13 @@ impl EntraSession {
             }
             Err(e) => return Err(e),
         };
+        let mut state = self.state.lock().expect("session state poisoned");
+        if state.generations.get(&sign_in.id).copied().unwrap_or(0) != generation {
+            return Err(KitError::NotSignedIn(format!(
+                "{} signed out",
+                sign_in.user_principal
+            )));
+        }
         if let Some(rotated) = resp
             .refresh_token
             .as_ref()
@@ -231,10 +266,7 @@ impl EntraSession {
             token: SecretString::from(resp.access_token),
             expires_on: OffsetDateTime::now_utc() + time::Duration::seconds(resp.expires_in as i64),
         };
-        self.cache
-            .lock()
-            .expect("token cache poisoned")
-            .insert(key, token.clone());
+        state.cache.insert(key, token.clone());
         Ok(token)
     }
 
@@ -245,11 +277,10 @@ impl EntraSession {
 
     /// Forget the sign-in: delete its refresh token and cached access tokens.
     pub fn logout(&self, sign_in: &SignIn) -> KitResult<()> {
+        let mut state = self.state.lock().expect("session state poisoned");
+        *state.generations.entry(sign_in.id.clone()).or_insert(0) += 1;
         self.secrets.delete(&self.key(&sign_in.id))?;
-        self.cache
-            .lock()
-            .expect("token cache poisoned")
-            .retain(|(id, _, _), _| id != &sign_in.id);
+        state.cache.retain(|(id, _, _), _| id != &sign_in.id);
         Ok(())
     }
 }
@@ -399,5 +430,88 @@ mod tests {
         let sign_in = s.login_device_code("organizations", |_| {}).await.unwrap();
         s.logout(&sign_in).unwrap();
         assert!(!s.is_signed_in(&sign_in).unwrap());
+    }
+
+    #[tokio::test]
+    async fn logout_during_in_flight_refresh_wins() {
+        let mut server = mockito::Server::new_async().await;
+        let _login = mock_device_login(&mut server).await;
+        let _refresh = server
+            .mock("POST", "/tenant-1/oauth2/v2.0/token")
+            .with_body_from_request(|_| {
+                std::thread::sleep(Duration::from_millis(300));
+                br#"{"access_token":"sb-at","refresh_token":"rt-2","expires_in":3600}"#.to_vec()
+            })
+            .create_async()
+            .await;
+        let store = Arc::new(MemoryStore::new());
+        let s = session(&server, store.clone());
+        let sign_in = s.login_device_code("organizations", |_| {}).await.unwrap();
+        let scope = "https://servicebus.azure.net/.default";
+        let (res, ()) = tokio::join!(s.token_for(&sign_in, None, scope), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            s.logout(&sign_in).unwrap();
+        });
+        assert!(
+            matches!(&res, Err(KitError::NotSignedIn(m)) if m.contains("signed out")),
+            "{res:?}"
+        );
+        assert!(!s.is_signed_in(&sign_in).unwrap());
+        assert!(store.get("test:entra:oid-1").unwrap().is_none());
+        assert!(s.token_for(&sign_in, None, scope).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_on_home_tenant_forgets_sign_in() {
+        let mut server = mockito::Server::new_async().await;
+        let _login = mock_device_login(&mut server).await;
+        let revoked = r#"{"error":"invalid_grant","error_description":"AADSTS50173: revoked."}"#;
+        let _home = server
+            .mock("POST", "/tenant-1/oauth2/v2.0/token")
+            .with_status(400)
+            .with_body(revoked)
+            .create_async()
+            .await;
+        let _other = server
+            .mock("POST", "/tenant-2/oauth2/v2.0/token")
+            .with_status(400)
+            .with_body(revoked)
+            .create_async()
+            .await;
+        let s = session(&server, Arc::new(MemoryStore::new()));
+        let sign_in = s.login_device_code("organizations", |_| {}).await.unwrap();
+        // A failure in another tenant must not forget the home sign-in.
+        let err = s
+            .token_for(&sign_in, Some("tenant-2"), "scope")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KitError::NotSignedIn(_)), "{err}");
+        assert!(s.is_signed_in(&sign_in).unwrap());
+        // The home tenant failing does.
+        let err = s.token_for(&sign_in, None, "scope").await.unwrap_err();
+        assert!(matches!(err, KitError::NotSignedIn(_)), "{err}");
+        assert!(!s.is_signed_in(&sign_in).unwrap());
+    }
+
+    #[tokio::test]
+    async fn client_id_mismatch_is_not_signed_in_without_refresh() {
+        let mut server = mockito::Server::new_async().await;
+        let _login = mock_device_login(&mut server).await;
+        let refresh = server
+            .mock("POST", "/tenant-1/oauth2/v2.0/token")
+            .expect(0)
+            .create_async()
+            .await;
+        let store = Arc::new(MemoryStore::new());
+        let s = session(&server, store.clone());
+        let sign_in = s.login_device_code("organizations", |_| {}).await.unwrap();
+        let other = EntraSession::new(AzureCloud::Public, store.clone(), "test")
+            .with_oauth(OAuthClient::new(server.url(), "other-cid"));
+        let err = other.token_for(&sign_in, None, "scope").await.unwrap_err();
+        assert!(
+            matches!(&err, KitError::NotSignedIn(m) if m.contains("different client")),
+            "{err}"
+        );
+        refresh.assert_async().await;
     }
 }
