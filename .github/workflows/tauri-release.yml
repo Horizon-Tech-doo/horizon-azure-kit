@@ -1,5 +1,28 @@
 name: Tauri desktop release (reusable)
 
+# Reusable release workflow for Tauri desktop apps (called with workflow_call).
+#
+# Layout: the caller repo is checked out into `product/` and the kit into
+# `horizon-azure-kit/`, side by side, so path dependencies such as
+# `../horizon-azure-kit/...` resolve.
+#
+# Inputs:
+#   app-name          Display name used in the release title.
+#   project-path      Directory (relative to the caller repo root) holding the
+#                     frontend package.json. Default: app.
+#   cargo-workspace   Directory (relative to the caller repo root) containing the
+#                     Cargo workspace whose target/ is cached. Use "." when the
+#                     Tauri crate is a member of the root workspace (Dispatched),
+#                     or e.g. "app/src-tauri" for a standalone app workspace
+#                     (Arkived). Default: "." (unchanged).
+#   tag-prefix        Git tag prefix; the version is appended. Default: app-v.
+#   kit-ref           Git ref of horizon-azure-kit to check out. Default: main.
+#                     Pin it to a tag or commit to pin the kit version.
+#
+# Permissions: a reusable workflow's GITHUB_TOKEN permissions are capped by the
+# caller, so the calling workflow must grant `permissions: contents: write`.
+#
+
 on:
   workflow_call:
     inputs:
@@ -7,6 +30,7 @@ on:
       project-path: { required: false, type: string, default: app }
       cargo-workspace: { required: false, type: string, default: "." }
       tag-prefix: { required: false, type: string, default: app-v }
+      kit-ref: { required: false, type: string, default: main }
     secrets:
       TAURI_SIGNING_PRIVATE_KEY: { required: true }
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: { required: true }
@@ -31,7 +55,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { path: product }
       - uses: actions/checkout@v4
-        with: { repository: Horizon-Tech-doo/horizon-azure-kit, path: horizon-azure-kit }
+        with: { repository: Horizon-Tech-doo/horizon-azure-kit, ref: "${{ inputs.kit-ref }}", path: horizon-azure-kit }
       - name: Install Linux dependencies
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
