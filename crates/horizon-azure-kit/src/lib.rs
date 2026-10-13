@@ -8,6 +8,7 @@
 
 pub mod cloud;
 pub mod error;
+pub mod secrets;
 
 pub use cloud::AzureCloud;
 pub use error::{KitError, KitResult};
