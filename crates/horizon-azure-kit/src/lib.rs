@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod cloud;
 pub mod error;
+pub mod sas;
 pub mod secrets;
 
 pub use cloud::AzureCloud;
