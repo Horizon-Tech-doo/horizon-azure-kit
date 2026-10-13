@@ -1,11 +1,33 @@
 //! Microsoft Entra OAuth 2.0 endpoints (v2.0).
 
 use crate::{KitError, KitResult};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Bytes escaped in tenant path segments: everything except unreserved `- _ . ~`.
+const TENANT_ESCAPE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+/// Maximum characters of a non-JSON error body kept in an error message.
+const SNIPPET_MAX_CHARS: usize = 300;
+
+/// First line of an error body, truncated, so that HTML gateway pages do not
+/// flood error messages or logs.
+fn snippet(body: &str) -> String {
+    body.lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(SNIPPET_MAX_CHARS)
+        .collect()
+}
+
 /// Response of the `/devicecode` endpoint.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct DeviceCodeResponse {
     /// Code the user types at `verification_uri`.
     pub user_code: String,
@@ -21,8 +43,21 @@ pub struct DeviceCodeResponse {
     pub message: String,
 }
 
+impl std::fmt::Debug for DeviceCodeResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodeResponse")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("device_code", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
 /// Successful token-endpoint response.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct TokenResponse {
     /// Bearer access token.
     pub access_token: String,
@@ -37,6 +72,21 @@ pub struct TokenResponse {
     /// Granted scopes.
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"<redacted>")
+            .field("id_token", &self.id_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,7 +108,11 @@ impl OAuthClient {
     /// Build a client. `authority_host` is e.g. `https://login.microsoftonline.com`.
     pub fn new(authority_host: impl Into<String>, client_id: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .expect("reqwest client builds"),
             authority_host: authority_host.into().trim_end_matches('/').to_string(),
             client_id: client_id.into(),
         }
@@ -70,6 +124,7 @@ impl OAuthClient {
     }
 
     fn endpoint(&self, tenant: &str, path: &str) -> String {
+        let tenant = utf8_percent_encode(tenant, TENANT_ESCAPE);
         format!("{}/{tenant}/oauth2/v2.0/{path}", self.authority_host)
     }
 
@@ -90,7 +145,8 @@ impl OAuthClient {
         let body = resp.text().await.map_err(KitError::network)?;
         if !status.is_success() {
             return Err(KitError::AuthFailed(format!(
-                "devicecode endpoint returned {status}: {body}"
+                "devicecode endpoint returned {status}: {}",
+                snippet(&body)
             )));
         }
         serde_json::from_str(&body)
@@ -207,7 +263,7 @@ impl OAuthClient {
         }
         Ok(Err(serde_json::from_str(&body).unwrap_or(TokenError {
             error: "unknown_error".into(),
-            error_description: Some(body),
+            error_description: Some(snippet(&body)),
         })))
     }
 }
@@ -233,6 +289,70 @@ fn auth_error(err: TokenError) -> KitError {
 mod tests {
     use super::*;
     use mockito::Matcher;
+
+    #[test]
+    fn debug_output_redacts_tokens() {
+        let token = TokenResponse {
+            access_token: "SECRET_ACCESS".into(),
+            id_token: Some("SECRET_ID".into()),
+            refresh_token: Some("SECRET_REFRESH".into()),
+            expires_in: 3600,
+            scope: Some("s".into()),
+        };
+        let dbg = format!("{token:?}");
+        assert!(!dbg.contains("SECRET_ACCESS"), "{dbg}");
+        assert!(!dbg.contains("SECRET_ID"), "{dbg}");
+        assert!(!dbg.contains("SECRET_REFRESH"), "{dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+
+        let no_optionals = TokenResponse {
+            access_token: "SECRET_ACCESS".into(),
+            id_token: None,
+            refresh_token: None,
+            expires_in: 1,
+            scope: None,
+        };
+        let dbg = format!("{no_optionals:?}");
+        assert!(dbg.contains("id_token: None"), "{dbg}");
+        assert!(dbg.contains("refresh_token: None"), "{dbg}");
+
+        let dc = DeviceCodeResponse {
+            user_code: "AB-CD".into(),
+            verification_uri: "https://microsoft.com/devicelogin".into(),
+            device_code: "SECRET_DEVICE".into(),
+            expires_in: 900,
+            interval: 5,
+            message: "go".into(),
+        };
+        let dbg = format!("{dc:?}");
+        assert!(!dbg.contains("SECRET_DEVICE"), "{dbg}");
+        assert!(dbg.contains("AB-CD"), "{dbg}");
+    }
+
+    #[test]
+    fn snippet_keeps_first_line_and_truncates() {
+        assert_eq!(snippet("<html>\n<body>gateway</body>"), "<html>");
+        assert_eq!(snippet(""), "");
+        let long = "x".repeat(1000);
+        assert_eq!(snippet(&long).chars().count(), SNIPPET_MAX_CHARS);
+        let multibyte = "é".repeat(500);
+        assert_eq!(snippet(&multibyte).chars().count(), SNIPPET_MAX_CHARS);
+    }
+
+    #[test]
+    fn tenant_is_percent_encoded_in_endpoint() {
+        let client = OAuthClient::new("https://login.microsoftonline.com", "cid");
+        let url = client.endpoint("a/b?c", "token");
+        assert!(!url.contains("/b?"), "{url}");
+        assert_eq!(
+            url,
+            "https://login.microsoftonline.com/a%2Fb%3Fc/oauth2/v2.0/token"
+        );
+        assert_eq!(
+            client.endpoint("contoso.onmicrosoft.com", "token"),
+            "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token"
+        );
+    }
 
     fn token_json() -> &'static str {
         r#"{"access_token":"at","refresh_token":"rt","expires_in":3600,"token_type":"Bearer","scope":"s"}"#
