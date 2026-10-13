@@ -43,6 +43,8 @@ pub struct ConfirmRequest {
 impl ConfirmRequest {
     /// Production targets require the human to type the target name
     /// (GUI), pass an explicit flag (CLI), or approve per call (MCP).
+    /// [`require`] enforces this: a production request passes only with
+    /// [`Decision::ConfirmedTyped`] carrying the exact target name.
     pub fn requires_typed_confirmation(&self) -> bool {
         self.production
     }
@@ -53,6 +55,9 @@ impl ConfirmRequest {
 pub enum Decision {
     /// Proceed.
     Allow,
+    /// Proceed; the human typed this text to confirm. For production targets,
+    /// [`require`] only accepts this when the text equals the target name.
+    ConfirmedTyped(String),
     /// Refuse, with a reason shown to the caller.
     Deny(String),
 }
@@ -77,22 +82,55 @@ impl Policy for DenyAll {
     }
 }
 
-/// Allows everything. Tests and explicitly trusted automation only; never
-/// for agent-facing surfaces.
+/// Allows everything, including production targets (it answers each request
+/// with the target name as typed confirmation). Tests and explicitly trusted
+/// automation only; never for agent-facing surfaces.
 pub struct AllowAll;
 
 #[async_trait]
 impl Policy for AllowAll {
-    async fn confirm(&self, _req: &ConfirmRequest) -> Decision {
-        Decision::Allow
+    async fn confirm(&self, req: &ConfirmRequest) -> Decision {
+        Decision::ConfirmedTyped(req.target.clone())
     }
 }
 
-/// Ask `policy` and turn a denial into [`KitError::PolicyDenied`].
+/// Ask `policy` and turn a refusal into [`KitError::PolicyDenied`].
+///
+/// Production requests pass only with [`Decision::ConfirmedTyped`] carrying
+/// the exact target name. Plain [`Decision::Allow`] is refused for them.
 pub async fn require(policy: &dyn Policy, req: &ConfirmRequest) -> KitResult<()> {
     match policy.confirm(req).await {
-        Decision::Allow => Ok(()),
         Decision::Deny(reason) => Err(KitError::PolicyDenied(reason)),
+        Decision::Allow if req.requires_typed_confirmation() => {
+            Err(KitError::PolicyDenied(format!(
+                "{} is a production target; confirm by typing its name",
+                req.target
+            )))
+        }
+        Decision::Allow => Ok(()),
+        Decision::ConfirmedTyped(typed) if req.requires_typed_confirmation() => {
+            if typed == req.target {
+                Ok(())
+            } else {
+                Err(KitError::PolicyDenied(format!(
+                    "typed confirmation `{typed}` does not match `{}`",
+                    req.target
+                )))
+            }
+        }
+        Decision::ConfirmedTyped(_) => Ok(()),
+    }
+}
+
+/// Test-only policy that returns a fixed decision.
+#[cfg(test)]
+struct Fixed(Decision);
+
+#[cfg(test)]
+#[async_trait]
+impl Policy for Fixed {
+    async fn confirm(&self, _req: &ConfirmRequest) -> Decision {
+        self.0.clone()
     }
 }
 
@@ -115,12 +153,54 @@ mod tests {
     #[tokio::test]
     async fn deny_all_maps_to_policy_denied() {
         let err = require(&DenyAll, &req(false)).await.unwrap_err();
-        assert!(matches!(err, KitError::PolicyDenied(m) if m.contains("purge")));
+        assert!(matches!(&err, KitError::PolicyDenied(m)
+            if m.contains("purge") && m.contains("orders/$DeadLetterQueue")));
     }
 
     #[tokio::test]
     async fn allow_all_allows() {
         require(&AllowAll, &req(false)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allow_all_passes_production() {
+        require(&AllowAll, &req(true)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_plain_allow_is_denied() {
+        let err = require(&Fixed(Decision::Allow), &req(true))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, KitError::PolicyDenied(m)
+            if m.contains("orders/$DeadLetterQueue") && m.contains("typing its name")));
+    }
+
+    #[tokio::test]
+    async fn production_wrong_typed_confirmation_is_denied() {
+        let err = require(
+            &Fixed(Decision::ConfirmedTyped("orders/Other".into())),
+            &req(true),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(&err, KitError::PolicyDenied(m)
+            if m.contains("orders/Other") && m.contains("orders/$DeadLetterQueue")));
+    }
+
+    #[tokio::test]
+    async fn production_matching_typed_confirmation_passes() {
+        require(
+            &Fixed(Decision::ConfirmedTyped("orders/$DeadLetterQueue".into())),
+            &req(true),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_production_plain_allow_passes() {
+        require(&Fixed(Decision::Allow), &req(false)).await.unwrap();
     }
 
     #[test]
