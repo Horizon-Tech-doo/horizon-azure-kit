@@ -6,6 +6,7 @@
 #![deny(rust_2018_idioms, unsafe_code, missing_docs)]
 #![warn(clippy::all)]
 
+pub mod auth;
 pub mod cloud;
 pub mod error;
 pub mod secrets;
