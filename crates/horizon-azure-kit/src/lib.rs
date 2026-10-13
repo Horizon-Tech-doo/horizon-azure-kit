@@ -10,6 +10,7 @@ pub mod arm;
 pub mod auth;
 pub mod cloud;
 pub mod error;
+pub mod safety;
 pub mod sas;
 pub mod secrets;
 
