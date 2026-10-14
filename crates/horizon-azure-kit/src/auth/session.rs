@@ -58,7 +58,8 @@ type CacheKey = (String, String, String); // (sign-in id, tenant, scope)
 #[derive(Default)]
 struct SessionState {
     cache: HashMap<CacheKey, AccessToken>,
-    /// Bumped by `logout`, so a refresh that started before a sign-out can detect it.
+    /// Bumped by `logout` and `finish_login`, so a refresh that started before a
+    /// sign-out or a fresh sign-in can detect it.
     generations: HashMap<String, u64>,
 }
 
@@ -168,8 +169,15 @@ impl EntraSession {
             client_id: self.oauth.client_id().to_string(),
         };
         let json = serde_json::to_string(&stored).expect("StoredRefresh serializes");
-        self.secrets
-            .put(&self.key(&id), &SecretString::from(json))?;
+        {
+            // Bump under the lock before storing, so a refresh that began
+            // earlier cannot delete or overwrite this fresh sign-in.
+            let mut state = self.state.lock().expect("session state poisoned");
+            *state.generations.entry(id.clone()).or_insert(0) += 1;
+            state.cache.retain(|(cached_id, _, _), _| cached_id != &id);
+            self.secrets
+                .put(&self.key(&id), &SecretString::from(json))?;
+        }
         Ok(SignIn {
             id,
             user_principal,
@@ -177,6 +185,16 @@ impl EntraSession {
             display_name: claims.name,
             cloud: self.cloud,
         })
+    }
+
+    fn generation(&self, sign_in_id: &str) -> u64 {
+        self.state
+            .lock()
+            .expect("session state poisoned")
+            .generations
+            .get(sign_in_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn load(&self, sign_in: &SignIn) -> KitResult<StoredRefresh> {
@@ -196,6 +214,9 @@ impl EntraSession {
         tenant: Option<&str>,
         scope: &str,
     ) -> KitResult<AccessToken> {
+        // Snapshot before `load`: a logout or login after this point changes
+        // the generation, so the checks below detect it.
+        let generation = self.generation(&sign_in.id);
         let stored = self.load(sign_in)?;
         if stored.client_id != self.oauth.client_id() {
             return Err(KitError::NotSignedIn(format!(
@@ -206,15 +227,14 @@ impl EntraSession {
         let home = tenant.is_none_or(|t| t == stored.tenant_id);
         let tenant = tenant.unwrap_or(&stored.tenant_id).to_string();
         let key = (sign_in.id.clone(), tenant.clone(), scope.to_string());
-        let generation = {
+        {
             let state = self.state.lock().expect("session state poisoned");
             if let Some(hit) = state.cache.get(&key)
                 && hit.expires_on - OffsetDateTime::now_utc() > REFRESH_MARGIN
             {
                 return Ok(hit.clone());
             }
-            state.generations.get(&sign_in.id).copied().unwrap_or(0)
-        };
+        }
         let resp = match self
             .oauth
             .refresh(
@@ -249,10 +269,13 @@ impl EntraSession {
                 sign_in.user_principal
             )));
         }
-        if let Some(rotated) = resp
-            .refresh_token
-            .as_ref()
-            .filter(|rt| **rt != stored.refresh_token)
+        // Only home-tenant rotations replace the stored token; a token minted
+        // for another tenant must not overwrite the home refresh token.
+        if home
+            && let Some(rotated) = resp
+                .refresh_token
+                .as_ref()
+                .filter(|rt| **rt != stored.refresh_token)
         {
             let updated = StoredRefresh {
                 refresh_token: rotated.clone(),
@@ -513,5 +536,77 @@ mod tests {
             "{err}"
         );
         refresh.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_refresh_does_not_replace_home_refresh_token() {
+        let mut server = mockito::Server::new_async().await;
+        let _login = mock_device_login(&mut server).await;
+        let _guest = server
+            .mock("POST", "/tenant-2/oauth2/v2.0/token")
+            .with_status(200)
+            .with_body(
+                r#"{"access_token":"guest-at","refresh_token":"rt-guest","expires_in":3600}"#,
+            )
+            .create_async()
+            .await;
+        let store = Arc::new(MemoryStore::new());
+        let s = session(&server, store.clone());
+        let sign_in = s.login_device_code("organizations", |_| {}).await.unwrap();
+        let t = s
+            .token_for(&sign_in, Some("tenant-2"), "scope")
+            .await
+            .unwrap();
+        assert_eq!(t.token.expose_secret(), "guest-at");
+        let stored = store.get("test:entra:oid-1").unwrap().unwrap();
+        assert!(
+            stored.expose_secret().contains("rt-1"),
+            "home refresh token must be kept"
+        );
+        assert!(!stored.expose_secret().contains("rt-guest"));
+    }
+
+    #[tokio::test]
+    async fn fresh_login_survives_an_in_flight_revocation() {
+        let mut server = mockito::Server::new_async().await;
+        let _login = mock_device_login(&mut server).await;
+        let _slow_revoked = server
+            .mock("POST", "/tenant-1/oauth2/v2.0/token")
+            .with_status(400)
+            .with_body_from_request(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                br#"{"error":"invalid_grant","error_description":"AADSTS50173: revoked"}"#.to_vec()
+            })
+            .create_async()
+            .await;
+        let store = Arc::new(MemoryStore::new());
+        let s = Arc::new(session(&server, store.clone()));
+        let sign_in = s.login_device_code("organizations", |_| {}).await.unwrap();
+        let s2 = s.clone();
+        let si2 = sign_in.clone();
+        let refresh = tokio::spawn(async move { s2.token_for(&si2, None, "scope").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // The user signs in again while the doomed refresh is still in flight.
+        // `finish_login` is called directly: the mock server blocks while it
+        // sleeps, so a second HTTP sign-in would only run after the refresh failed.
+        let id_token = test_jwt(
+            r#"{"tid":"tenant-1","oid":"oid-1","preferred_username":"a@x.io","name":"A"}"#,
+        );
+        s.finish_login(
+            "organizations",
+            TokenResponse {
+                access_token: "arm-at".into(),
+                id_token: Some(id_token),
+                refresh_token: Some("rt-fresh".into()),
+                expires_in: 3600,
+                scope: None,
+            },
+        )
+        .unwrap();
+        assert!(refresh.await.unwrap().is_err());
+        assert!(
+            s.is_signed_in(&sign_in).unwrap(),
+            "fresh login must not be deleted"
+        );
     }
 }
