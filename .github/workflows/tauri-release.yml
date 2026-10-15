@@ -19,6 +19,9 @@ name: Tauri desktop release (reusable)
 #   kit-ref           Git ref of horizon-azure-kit to check out. Default: main.
 #                     Pin it to a tag or commit to pin the kit version.
 #
+# macOS signing: set the APPLE_* secrets in the caller repo (see the
+# "Apple signing" step); without them macOS builds stay unsigned.
+#
 # Permissions: a reusable workflow's GITHUB_TOKEN permissions are capped by the
 # caller, so the calling workflow must grant `permissions: contents: write`.
 #
@@ -72,6 +75,27 @@ jobs:
       - name: Install frontend dependencies
         working-directory: product/${{ inputs.project-path }}
         run: npm ci
+      # macOS code signing and notarization, only when the caller repo has the
+      # secrets (APPLE_CERTIFICATE = base64 .p12, APPLE_CERTIFICATE_PASSWORD,
+      # APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD = app-specific password,
+      # APPLE_TEAM_ID). Unset secrets are not exported, so repos without them
+      # keep building unsigned instead of failing on an empty certificate.
+      - name: Apple signing (when configured)
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -n "${!v}" ]; then
+              { echo "$v<<__APPLE_EOF__"; echo "${!v}"; echo "__APPLE_EOF__"; } >> "$GITHUB_ENV"
+            fi
+          done
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

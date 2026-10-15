@@ -16,6 +16,7 @@ Licensed under Apache-2.0.
 
 ## Changes
 
+- **0.2.1**: the shared Tauri release workflow signs and notarizes macOS builds when the caller repo sets the `APPLE_*` secrets; without them builds stay unsigned. No crate changes.
 - **0.2.0**
   - `EntraSession::token_for` no longer replaces the stored (home-tenant) refresh token after refreshing against another tenant.
   - Signing in again wins over a refresh that is still in flight.
